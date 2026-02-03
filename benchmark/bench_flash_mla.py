@@ -3,13 +3,15 @@ import argparse
 import math
 import random
 
-import flashinfer
+# import flashinfer
 import torch
 import triton
 import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 # pip install flashinfer-python
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+# from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 
 def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
@@ -183,12 +185,16 @@ def _mla_attn_kernel(
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
     for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
+        # offs_n = start_n + tl.arange(0, BLOCK_N)
+        # kv_page_number = tl.load(
+        #     Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE,
+        #     mask=offs_n < split_kv_end,
+        #     other=0,
+        # )
         kv_page_number = tl.load(
-            Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE,
-            mask=offs_n < split_kv_end,
-            other=0,
+            Req_to_tokens + stride_req_to_tokens_bs * cur_batch + start_n // PAGE_SIZE,
         )
+        offs_n = start_n + tl.arange(0, BLOCK_N)
         kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
         offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv[:, None]
         k_c = tl.load(Kv_c_cache + offs_k_c, mask=offs_n[None, :] < split_kv_end, other=0.0)
@@ -218,6 +224,218 @@ def _mla_attn_kernel(
     offs_o_1 = cur_batch * stride_o_b + cur_head * stride_o_h + split_kv_id * stride_o_s + HEAD_DIM_CKV
     tl.store(O + offs_o_1, e_max + tl.log(e_sum))
 
+@gluon.jit
+def _mla_attn_kernel_gluon(
+    Q_nope,
+    Q_pe,
+    Kv_c_cache,
+    K_pe_cache,
+    Req_to_tokens,
+    B_seq_len,
+    O,
+    sm_scale,
+    stride_q_nope_bs,
+    stride_q_nope_h,
+    stride_q_pe_bs,
+    stride_q_pe_h,
+    stride_kv_c_bs,
+    stride_k_pe_bs,
+    stride_req_to_tokens_bs,
+    stride_o_b,
+    stride_o_h,
+    stride_o_s,
+    BLOCK_H: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    HEAD_DIM_CKV: gl.constexpr,
+    HEAD_DIM_KPE: gl.constexpr,
+):
+    cur_batch = gl.program_id(1)
+    cur_head_id = gl.program_id(0)
+    split_kv_id = gl.program_id(2)
+
+    cur_batch_seq_len = gl.load(B_seq_len + cur_batch)
+
+
+    # layout for Q
+    # 64x512
+    blocked_q_nope: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[1, 64],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+    shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs = [[512,16]],
+        offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1,0], [2,0], [4,0], [8,0], [16,0], [32,0]],
+        block_bases = [],
+        shape = [64, 512]
+    )
+    # 64x64
+    blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=((0,1),(0,2), (0,4), (32, 0)),
+        lane_bases=((0, 8), (0, 16), (0, 32), (4, 0), (8, 0), (16, 0)),
+        warp_bases=((1, 0), (2, 0)),
+        block_bases=[],
+        shape=[64, 64],
+    )
+    shared_q_pe: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs = [[512,16]],
+        offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4,0], [8,0], [16, 0], [1,0], [2,0], [32, 0]],
+        block_bases = [],
+        shape = [64, 64]
+    )
+    dtype = Q_nope.type.element_ty
+    gl.static_assert(dtype == gl.bfloat16)
+    gl.static_assert(Q_pe.type.element_ty == dtype)
+    buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
+    buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
+
+    # layout for KV
+    # 512x32
+    blocked_kv: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[8, 1],
+        threads_per_warp=[64, 1],
+        warps_per_cta=[1, 4],
+        order=[0, 1],
+    )
+    shared_kv: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[0, 1])
+    # 64x32
+    blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=((1,0), (2,0), (4,0)),
+        lane_bases=((8, 0), (16, 0), (32, 0), (0, 4), (0, 8), (0, 16)),
+        warp_bases=((0, 1), (0, 2)),
+        block_bases=[],
+        shape=[64, 32],
+    )
+    shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs = [[512,16]],
+        offset_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0,4], [0,8], [0, 16], [0,1], [0,2]],
+        block_bases = [],
+        shape = [64, 32]
+    )
+    gl.static_assert(Kv_c_cache.type.element_ty == dtype)
+    gl.static_assert(K_pe_cache.type.element_ty == dtype)
+    #bufs_kv = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
+    #bufs_kpe = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
+    buf_kv = gl.allocate_shared_memory(dtype, shape=[HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
+    buf_kpe = gl.allocate_shared_memory(dtype, shape=[HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
+
+    # layout for mfma
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mfma_layout_a: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=8
+    )
+    mfma_layout_b: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=8
+    )
+    linear_v: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=((1,0), (2,0), (4,0), (0, 16), (32,0), (64,0), (128,0), (256,0)),
+        lane_bases=((0, 1), (0, 2), (0, 4), (0, 8), (8, 0), (16, 0)),
+        warp_bases=((0, 0), (0, 0)),
+        block_bases=[],
+        shape=[512, 32],
+    )
+
+
+    offs_d_ckv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_q_nope))
+    cur_head = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
+    offs_q_nope = cur_batch * stride_q_nope_bs + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
+    # q_nope = gl.load(Q_nope + offs_q_nope)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.wait_group(0)
+    q_nope = buf_q_nope.load(layout=mfma_layout_a)
+
+    offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
+    cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
+    offs_q_pe = cur_batch * stride_q_pe_bs + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+    # q_pe = gl.load(Q_pe + offs_q_pe)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe)
+    gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.wait_group(0)
+    q_pe = buf_q_pe.load(layout=mfma_layout_a)
+
+    e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
+    e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
+    acc = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout)
+
+    kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    # num_kv_splits == 1
+    for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+        # assert page_size % block_n == 0
+        kv_page_number = gl.load(
+            Req_to_tokens + stride_req_to_tokens_bs * cur_batch + start_n // PAGE_SIZE,
+        )
+        offs_n = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
+        kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+        offs_d_ckv_1 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv))
+        offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv_1[:, None]
+        # k_c = gl.load(Kv_c_cache + offs_k_c, mask=offs_n[None, :] < split_kv_end, other=0.0)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_kv, Kv_c_cache, offs_k_c, mask=offs_n[None, :] < split_kv_end)
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
+        k_c = buf_kv.load(layout=mfma_layout_b)
+
+        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(q_nope.dtype), zeros)
+
+        offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
+        kv_loc_pe = kv_page_number * PAGE_SIZE + offs_n_pe % PAGE_SIZE
+        offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
+        offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None]
+        # k_pe = gl.load(K_pe_cache + offs_k_pe, mask=offs_n[None, :] < split_kv_end, other=0.0)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_kpe, K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
+        k_pe = buf_kpe.load(layout=mfma_layout_b)
+
+        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
+        qk *= sm_scale
+
+        offs_n_qk = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
+        qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
+
+
+        # cross warp reduction
+        n_e_max = gl.maximum(gl.max(qk, 1), e_max)
+
+        re_scale = gl.exp(e_max - n_e_max)
+        p = gl.exp(qk - n_e_max[:, None])
+        # move around p???
+        e_sum = e_sum * re_scale + gl.sum(p, 1)
+        e_max = n_e_max
+        # convert throught lds
+        p = p.to(dtype)
+        p = gl.convert_layout(p, mfma_layout_a)
+
+        acc *= re_scale[:, None]
+        v_c = buf_kv.load(layout=linear_v)
+        # v_c = gl.trans(v_c)
+        v_c = gl.permute(v_c, [1, 0])
+        v_c = gl.convert_layout(v_c, mfma_layout_b)
+        acc = gl.amd.cdna4.mfma(p, v_c, acc)
+
+    cur_head_o = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
+    offs_d_ckv_o = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
+    offs_o = cur_batch * stride_o_b + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_s + offs_d_ckv_o[None, :]
+    # gl.store(O + offs_o, acc / e_sum[:, None])
+    stored_value = (acc / e_sum[:, None]).to(dtype)
+    gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
+
+    offs_o_1 = cur_batch * stride_o_b + cur_head_o * stride_o_h + split_kv_id * stride_o_s + HEAD_DIM_CKV
+    # gl.store(O + offs_o_1, e_max + gl.log(e_sum))
+    stored_value = (e_max + gl.log(e_sum)).to(dtype)
+    gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o_1)
 
 def _mla_attn(
     q_nope,
@@ -235,14 +453,17 @@ def _mla_attn(
     head_dim_ckv = q_nope.shape[-1]
     head_dim_kpe = q_pe.shape[-1]
 
-    BLOCK_H = 16
-    BLOCK_N = 64
+    # BLOCK_H = 16
+    # BLOCK_N = 64
+    BLOCK_H = 64
+    BLOCK_N = 32
     grid = (
         triton.cdiv(head_num, BLOCK_H),
         batch_size,
         num_kv_splits,
     )
-    _mla_attn_kernel[grid](
+    # _mla_attn_kernel[grid](
+    _mla_attn_kernel_gluon[grid](
         q_nope,
         q_pe,
         kv_c_cache,
@@ -389,7 +610,8 @@ def run_flash_mla_triton(q, block_table, blocked_k, max_seqlen_pad, block_size, 
     blocked_k_nope, blocked_k_pe = blocked_k[..., :dv].contiguous(), blocked_k[..., dv:].contiguous()
 
     def flash_mla_triton():
-        num_kv_splits = 32
+        # num_kv_splits = 32
+        num_kv_splits = 1
         o = torch.empty([b * s_q, h_q, dv])
         attn_logits = torch.empty([b * s_q, h_q, num_kv_splits, dv + 1])
         mla_decode_triton(q_nope.view(-1, h_q, dv), q_pe.view(-1, h_q, d-dv), blocked_k_nope.view(-1, dv), blocked_k_pe.view(-1, d-dv), o, block_table, cache_seqlens, attn_logits, num_kv_splits, 1 / math.sqrt(d), block_size)
@@ -435,6 +657,7 @@ def compare_ab(baseline, target, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal
     out_b, lse_b, perf_b = target_func(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_q, cache_seqlens, h_q, h_kv, d, dv, causal, dtype)
     
     torch.testing.assert_close(out_b.float(), out_a.float(), atol=1e-2, rtol=1e-2), "out"
+    print("output match")
     if target not in ["flash_infer", "flash_mla_triton"] and baseline not in ["flash_infer", "flash_mla_triton"]:
         # flash_infer has a different lse return value
         # flash_mla_triton doesn't return lse
@@ -484,19 +707,22 @@ available_targets = [
     "flash_mla_triton",
 ]
 
+# batch = 128, head_nums = 128
+# each workgroup handles 64 heads, so grid size is 256 (align with 256CU)
 shape_configs = [
     {"b": batch, "s_q": 1, "cache_seqlens": torch.tensor([seqlen + 2 * i for i in range(batch)], dtype=torch.int32, device="cuda"), "h_q": head, "h_kv": 1, "d": 512+64, "dv": 512, "causal": True, "dtype": torch.bfloat16}
-    for batch in [128] for seqlen in [1024, 2048, 4096, 8192, 8192*2, 8192*4] for head in [128]
+    for batch in [128] for seqlen in [4096] for head in [128]
+    # for batch in [128] for seqlen in [1024, 2048, 4096, 8192, 8192*2, 8192*4] for head in [128]
 ]
 
 
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", type=str, default="torch")
-    parser.add_argument("--target", type=str, default="flash_mla")
+    parser.add_argument("--target", type=str, default="flash_mla_triton")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--one", action="store_true")
-    parser.add_argument("--compare", action="store_true")
+    parser.add_argument("--compare", action="store_false")
     args = parser.parse_args()
     return args
 
@@ -518,3 +744,4 @@ if __name__ == "__main__":
             elif args.one:
                 perf = compare_a(args.target, shape["b"], shape["s_q"], shape["cache_seqlens"], shape["h_q"], shape["h_kv"], shape["d"], shape["dv"], shape["causal"], shape["dtype"])
                 fout.write(f'{args.target},{shape["b"]},{shape["cache_seqlens"].float().mean().cpu().item():.0f},{shape["h_q"]},{perf:.0f}\n')
+
