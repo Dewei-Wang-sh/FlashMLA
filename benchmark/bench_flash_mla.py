@@ -322,6 +322,14 @@ def _mla_attn_kernel_gluon(
     buf_kv = gl.allocate_shared_memory(dtype, shape=[HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
     buf_kpe = gl.allocate_shared_memory(dtype, shape=[HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
 
+    linear_v: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=((0, 1), (0, 2), (0, 4), (16,0), (32,0), (64,0), (128,0), (256,0)),
+        lane_bases=((1,0), (2,0), (4,0), (8, 0), (0, 8), (0, 16)),
+        warp_bases=((0, 0), (0, 0)),
+        block_bases=[],
+        shape=[512, 32],
+    )
+
     # layout for mfma
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -334,13 +342,6 @@ def _mla_attn_kernel_gluon(
     )
     mfma_layout_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=mfma_layout, k_width=8
-    )
-    linear_v: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((1,0), (2,0), (4,0), (0, 16), (32,0), (64,0), (128,0), (256,0)),
-        lane_bases=((0, 1), (0, 2), (0, 4), (0, 8), (8, 0), (16, 0)),
-        warp_bases=((0, 0), (0, 0)),
-        block_bases=[],
-        shape=[512, 32],
     )
 
 
@@ -406,7 +407,6 @@ def _mla_attn_kernel_gluon(
         qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
 
 
-        # cross warp reduction
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
 
         re_scale = gl.exp(e_max - n_e_max)
@@ -414,7 +414,7 @@ def _mla_attn_kernel_gluon(
         # move around p???
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         e_max = n_e_max
-        # convert throught lds
+        # convert type, convert layout or vice versa?
         p = p.to(dtype)
         p = gl.convert_layout(p, mfma_layout_a)
 
@@ -429,7 +429,10 @@ def _mla_attn_kernel_gluon(
     offs_d_ckv_o = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
     offs_o = cur_batch * stride_o_b + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_s + offs_d_ckv_o[None, :]
     # gl.store(O + offs_o, acc / e_sum[:, None])
-    stored_value = (acc / e_sum[:, None]).to(dtype)
+    # stored_value = (acc / e_sum[:, None]).to(dtype)
+    rcp = 1.0 / e_sum
+    stored_value = (acc * rcp[:, None]).to(dtype)
+    # use larger store size?
     gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
 
     offs_o_1 = cur_batch * stride_o_b + cur_head_o * stride_o_h + split_kv_id * stride_o_s + HEAD_DIM_CKV
