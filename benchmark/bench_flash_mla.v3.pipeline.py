@@ -377,11 +377,10 @@ def _mla_attn_kernel_gluon(
         Req_to_tokens + stride_req_to_tokens_bs * cur_batch + start_n // PAGE_SIZE,
     )
 
-    # local load Q 
-    gl.amd.cdna4.async_copy.wait_group(1)
-    q_nope = buf_q_nope.load(layout=mfma_layout_a)
+    # local load Q
     gl.amd.cdna4.async_copy.wait_group(0)
-    q_pe = buf_q_pe.load(layout=mfma_layout_a)
+    q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope, mfma_layout_a)
+    q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
 
     # global load K_nope
     offs_n = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
@@ -390,7 +389,7 @@ def _mla_attn_kernel_gluon(
     offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv_1[:, None]
     gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv.index(0), Kv_c_cache, offs_k_c) #, mask=offs_n[None, :] < split_kv_end)
     gl.amd.cdna4.async_copy.commit_group()
-    
+
     # global load K_pe
     offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
     kv_loc_pe = kv_page_number * PAGE_SIZE + offs_n_pe % PAGE_SIZE
@@ -429,22 +428,20 @@ def _mla_attn_kernel_gluon(
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
         gl.amd.cdna4.async_copy.commit_group()
 
-        start_n += BLOCK_N
+        # dot, softmax, dot
+        gl.amd.cdna4.async_copy.wait_group(2)
+        k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
+        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(q_nope.dtype), zeros)
+        k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(buf_idx), mfma_layout_b)
+        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
 
+        start_n += BLOCK_N
         # global load page number
         kv_page_number = gl.load(
             Req_to_tokens + stride_req_to_tokens_bs * cur_batch + start_n // PAGE_SIZE,
         )
 
-        # dot, softmax, dot
-        gl.amd.cdna4.async_copy.wait_group(3)
-        k_c = bufs_kv.index(buf_idx).load(layout=mfma_layout_b)
-        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(q_nope.dtype), zeros)
-
-        gl.amd.cdna4.async_copy.wait_group(2)
-        k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
-        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
         qk *= sm_scale
         # offs_n_qk = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
         offs_n_qk = i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
@@ -459,7 +456,7 @@ def _mla_attn_kernel_gluon(
         p = p.to(dtype)
         p = gl.convert_layout(p, mfma_layout_a)
         acc *= re_scale[:, None]
-        v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
+        v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), linear_v)
         # v_c = gl.trans(v_c)
         v_c = gl.permute(v_c, [1, 0])
         v_c = gl.convert_layout(v_c, mfma_layout_b)
