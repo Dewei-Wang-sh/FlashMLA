@@ -259,7 +259,7 @@ def _mla_attn_kernel_gluon(
 
 
     # layout for Q
-    # 64x512
+    # 128x512
     blocked_q_nope: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[1, 64],
@@ -268,23 +268,23 @@ def _mla_attn_kernel_gluon(
     )
     shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs = [[512,16]],
-        offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1,0], [2,0], [4,0], [8,0], [16,0], [32,0]],
+        offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1,0], [2,0], [4,0], [8,0], [16,0], [32,0], [64,0]],
         cga_layout = [],
-        shape = [64, 512]
+        shape = [128, 512]
     )
-    # 64x64
+    # 128x64
     blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((0,1),(0,2), (0,4), (32, 0)),
+        reg_bases=((0,1),(0,2), (0,4), (32, 0), (64, 0)),
         lane_bases=((0, 8), (0, 16), (0, 32), (4, 0), (8, 0), (16, 0)),
         warp_bases=((1, 0), (2, 0)),
         block_bases=[],
-        shape=[64, 64],
+        shape=[128, 64],
     )
     shared_q_pe: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs = [[512,16]],
-        offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4,0], [8,0], [16, 0], [1,0], [2,0], [32, 0]],
+        offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4,0], [8,0], [16, 0], [1,0], [2,0], [32,0], [64,0]],
         cga_layout = [],
-        shape = [64, 64]
+        shape = [128, 64]
     )
     dtype = Q_nope.type.element_ty
     gl.static_assert(dtype == gl.bfloat16)
@@ -317,10 +317,6 @@ def _mla_attn_kernel_gluon(
     )
     gl.static_assert(Kv_c_cache.type.element_ty == dtype)
     gl.static_assert(K_pe_cache.type.element_ty == dtype)
-    #bufs_kv = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
-    #bufs_kpe = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
-    buf_kv = gl.allocate_shared_memory(dtype, shape=[HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
-    buf_kpe = gl.allocate_shared_memory(dtype, shape=[HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
 
     linear_v: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=((0, 1), (0, 2), (0, 4), (16,0), (32,0), (64,0), (128,0), (256,0)),
@@ -333,7 +329,7 @@ def _mla_attn_kernel_gluon(
     # layout for mfma
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 32],
+        instr_shape=[32, 32, 16],
         transposed=True,
         warps_per_cta=[4, 1],
     )
@@ -371,6 +367,11 @@ def _mla_attn_kernel_gluon(
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
+    #################### move here to work around allocate_shared_memory bug
+    #bufs_kv = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
+    #bufs_kpe = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
+    buf_kv = gl.allocate_shared_memory(dtype, shape=[HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
+    buf_kpe = gl.allocate_shared_memory(dtype, shape=[HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
     # num_kv_splits == 1
     for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
         # assert page_size % block_n == 0
@@ -458,7 +459,7 @@ def _mla_attn(
 
     # BLOCK_H = 16
     # BLOCK_N = 64
-    BLOCK_H = 64
+    BLOCK_H = 128
     BLOCK_N = 32
     grid = (
         triton.cdiv(head_num, BLOCK_H),
