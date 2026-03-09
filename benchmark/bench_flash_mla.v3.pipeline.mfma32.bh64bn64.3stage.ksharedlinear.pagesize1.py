@@ -400,17 +400,9 @@ def _mla_attn_kernel_gluon(
     ################ prologue
     # global load page number
     offs_n = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
-    kv_page_number = gl.load(
-        Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE,
-        mask=offs_n < split_kv_end,
-        other=0,
-    )
+    kv_page_number = gl.amd.cdna3.buffer_load(Req_to_tokens, stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE, mask=offs_n < split_kv_end, other=0)
     offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
-    kv_page_number_pe = gl.load(
-        Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n_pe // PAGE_SIZE,
-        mask=offs_n_pe < split_kv_end,
-        other=0,
-    )
+    kv_page_number_pe = gl.amd.cdna3.buffer_load(Req_to_tokens, stride_req_to_tokens_bs * cur_batch + offs_n_pe // PAGE_SIZE, mask=offs_n_pe < split_kv_end, other=0)
 
     # local load Q
     gl.amd.cdna4.async_copy.wait_group(0)
@@ -439,17 +431,9 @@ def _mla_attn_kernel_gluon(
 
     # global load page number
     offs_n = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
-    kv_page_number = gl.load(
-        Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE,
-        mask=offs_n < split_kv_end,
-        other=0,
-    )
+    kv_page_number = gl.amd.cdna3.buffer_load(Req_to_tokens, stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE, mask=offs_n < split_kv_end, other=0)
     offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
-    kv_page_number_pe = gl.load(
-        Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n_pe // PAGE_SIZE,
-        mask=offs_n_pe < split_kv_end,
-        other=0,
-    )
+    kv_page_number_pe = gl.amd.cdna3.buffer_load(Req_to_tokens, stride_req_to_tokens_bs * cur_batch + offs_n_pe // PAGE_SIZE, mask=offs_n_pe < split_kv_end, other=0)
 
     gl.assume(num_iter > 3)
     buf_idx = 0
@@ -504,17 +488,9 @@ def _mla_attn_kernel_gluon(
         start_n += BLOCK_N
         # global load page number
         offs_n = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
-        kv_page_number = gl.load(
-            Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE,
-            mask=offs_n < split_kv_end,
-            other=0,
-        )
+        kv_page_number = gl.amd.cdna3.buffer_load(Req_to_tokens, stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE, mask=offs_n < split_kv_end, other=0)
         offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
-        kv_page_number_pe = gl.load(
-            Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n_pe // PAGE_SIZE,
-            mask=offs_n_pe < split_kv_end,
-            other=0,
-        )
+        kv_page_number_pe = gl.amd.cdna3.buffer_load(Req_to_tokens, stride_req_to_tokens_bs * cur_batch + offs_n_pe // PAGE_SIZE, mask=offs_n_pe < split_kv_end, other=0)
 
         acc = gl.amd.cdna4.mfma(p, v_c, acc)
 
