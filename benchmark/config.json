@@ -3,7 +3,7 @@
        {
            "kernel_include_regex": "mla_attn_kernel_gluon",
            "kernel_exclude_regex": "",
-           "kernel_iteration_range": "5",
+           "kernel_iteration_range": "15",
            "output_format":["json"],
            "advanced_thread_trace": true,
            "att_target_cu" : 0,
