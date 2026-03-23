@@ -349,8 +349,8 @@ def _mla_attn_kernel_gluon(
     gl.static_assert(K_pe_cache.type.element_ty == dtype)
 
     linear_v: gl.constexpr = gl.DistributedLinearLayout(
-        lane_bases=((1,0), (2,0), (4,0), (8, 0), (16, 0), (0, 8)),
         reg_bases=((0, 1), (0, 2), (0, 4), (0,16), (0,32), (64,0), (128,0), (256,0)),
+        lane_bases=((1,0), (2,0), (4,0), (8, 0), (16, 0), (0, 8)),
         warp_bases=((32, 0), (0, 0)),
         block_bases=[],
         shape=[512, 64],
