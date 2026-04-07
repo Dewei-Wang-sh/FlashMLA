@@ -1,0 +1,32 @@
+digraph CFG {
+    layout=neato;
+    overlap=true;
+    splines=ortho;
+    node [shape=box, style=filled, fillcolor=lightyellow, fontname="Courier", width=2, height=0.5];
+    edge [fontname="Courier"];
+
+    // ds_read_b128 and mfma0 half-overlap: centers 0.25" apart (node height=0.5")
+    ds_read_b128   [label="36 ds_read_b128",   pos="5,6!"];
+    mfma0          [label="36 mfma0",           pos="2.5,5.75!"];
+    softmax        [label="softmax",            pos="2.5,4.5!"];
+    ds_read_b64_tr [label="64 ds_read_b64_tr",  pos="5.5,4.5!"];
+    mfma1          [label="32 mfma1",           pos="4,3.3!"];
+    buffer_load_k0   [label="8 buffer_load_lds",   pos="8,6.5!"];
+    buffer_load_k1   [label="8 buffer_load_lds",   pos="8,5.2!"];
+
+    // Labels
+    lbl_ds_read_b128   [label="35*16+50=610", shape=plaintext, fillcolor=none, style="", pos="5,6.5!"];
+    lbl_mfma0          [label="35*32+48=1138", shape=plaintext, fillcolor=none, style="", pos="0.6,5.75!"];
+    lbl_softmax        [label="~1000(1300)", shape=plaintext, fillcolor=none, style="", pos="0.8,4.5!"];
+    lbl_ds_read_b64_tr [label="63*8+50=554", shape=plaintext, fillcolor=none, style="", pos="5.5,5!"];
+    lbl_mfma1          [label="31*32+48=1040", shape=plaintext, fillcolor=none, style="", pos="2,3.3!"];
+    buffer_load_latency          [label="~1000", shape=plaintext, fillcolor=none, style="", pos="8.5,5.8!"];
+
+    // Edges
+    ds_read_b128   -> mfma0;
+    buffer_load_k0 -> buffer_load_k1
+    mfma0          -> softmax;
+    softmax        -> mfma1;
+    ds_read_b64_tr -> mfma1;
+}
+

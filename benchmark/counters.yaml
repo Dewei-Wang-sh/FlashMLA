@@ -2,3 +2,9 @@ jobs:
   - pmc:
       - SQ_LDS_BANK_CONFLICT
       - SQ_LDS_DATA_FIFO_FULL
+      - TCP_TCC_READ_REQ_sum
+      - TCP_TOTAL_CACHE_ACCESSES_sum
+      - TCC_HIT_sum
+      - TCC_MISS_sum
+      - TCC_EA0_RDREQ_DRAM_sum
+      - TCC_EA0_WRREQ_DRAM_sum

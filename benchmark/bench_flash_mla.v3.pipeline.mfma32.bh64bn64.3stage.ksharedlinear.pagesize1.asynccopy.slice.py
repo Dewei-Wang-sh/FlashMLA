@@ -251,8 +251,8 @@ def _mla_attn_kernel_gluon(
     HEAD_DIM_CKV: gl.constexpr,
     HEAD_DIM_KPE: gl.constexpr,
 ):
-    cur_batch = gl.program_id(1)
-    cur_head_id = gl.program_id(0)
+    cur_batch = gl.program_id(0)
+    cur_head_id = gl.program_id(1)
     split_kv_id = gl.program_id(2)
 
     cur_batch_seq_len = gl.load(B_seq_len + cur_batch)
@@ -704,8 +704,8 @@ def _mla_attn(
     BLOCK_H = 64
     BLOCK_N = 64
     grid = (
-        triton.cdiv(head_num, BLOCK_H),
         batch_size,
+        triton.cdiv(head_num, BLOCK_H),
         num_kv_splits,
     )
     # _mla_attn_kernel[grid](
